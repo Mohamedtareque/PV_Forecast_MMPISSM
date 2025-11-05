@@ -1,0 +1,13 @@
+
+app01_venv/
+__pycache__/
+
+
+diagram.ipynb
+presentation_reports/
+
+data/
+
+experiments/
+
+splits/
