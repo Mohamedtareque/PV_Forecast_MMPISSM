@@ -582,6 +582,7 @@ def _tensor_from_norm(norm_df: pd.DataFrame, feature_cols: List[str]):
     # the first dimension of our output tensor.
     dates = list(norm_df.index.get_level_values("date").unique())
     # the second dimension of the tensor. finds the maximum bin ID (e.g., if you have 48 bins, the max ID would be 47), and adds 1 to get the total count.
+    # Hours (Records) with in the day.
     K = int(norm_df.index.get_level_values("bin_id").max()) + 1
     # the number of features, the third dim.
     F = len(feature_cols)
@@ -609,8 +610,12 @@ def _tensor_from_norm(norm_df: pd.DataFrame, feature_cols: List[str]):
 
 
 
-def build_model_arrays(norm_df: pd.DataFrame, feature_cols: List[str], target_col: str,
-                       history_days: int = 7, horizon_days: int = 1):
+def build_model_arrays(norm_df: pd.DataFrame, 
+                       feature_cols: List[str], 
+                       target_col: str,
+                       history_days: int = 7, 
+                       horizon_days: int = 1
+                       ):
     
     """sliding window generator: take a continuous block of time-series data and chop it up into many smaller, 
     overlapping samples that are suitable for training a sequence-to-sequence deep learning model (like an LSTM, GRU, or Transformer).

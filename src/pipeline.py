@@ -271,7 +271,7 @@ class SolarForecastingPipeline:
                         site_config,
                     )
                 else:
-                    # FIXED-GRID PATH (This is what you want)
+                    # FIXED-GRID PATH 
                     logger.info("Building FIXED-GRID reference frame (K_bins is None)...")
                     # Make sure you have imported build_reference_fixedgrid_frame
                     from .evaluation_utils import build_reference_fixedgrid_frame 

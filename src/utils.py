@@ -205,7 +205,9 @@ class DataManager:
 class ExperimentTracker:
     """Track experiments, save results and models
     
-    ts job is to create a self-contained, timestamped folder for every single experiment run, ensuring that all related files—configurations, models, metrics, and plots—are saved in one clean, predictable place.
+    Its job is to create a self-contained, timestamped folder for every single experiment run, 
+    ensuring that all related files—configurations, models, metrics, 
+    and plots—are saved in one clean, predictable place.
     """
     
     def __init__(self, experiment_name: str, base_dir: str = "experiments"):
@@ -240,8 +242,10 @@ class ExperimentTracker:
     
     def save_metrics(self, metrics: Dict, fold: int = 0, split: str = "test"):
         """Save evaluation metrics
-        Saves the trained PyTorch model's weights (state_dict). The is_best flag is a common pattern for saving only 
-        the model that achieved the best performance on the validation set, which is often the one you care about most.
+        Saves the trained PyTorch model's weights (state_dict). 
+        The is_best flag is a common pattern for saving only 
+        the model that achieved the best performance on the validation set, 
+        which is often the one you care about most.
         """
         filename = f"metrics_fold_{fold}_{split}.json"
         with open(self.exp_dir / "metrics" / filename, 'w') as f:
@@ -253,7 +257,7 @@ class ExperimentTracker:
         self.results[fold][split] = metrics
     
     def save_comparison_table(self, df: pd.DataFrame, fold: int = 0, split: str = "validation"):
-        """Persist detailed comparison data (model vs NAM vs actual)."""
+        """Persist detailed comparison data (model vs NAM vs actual, .... )."""
         if df.empty:
             logger.warning(
                 "Comparison dataframe for fold %s / %s is empty; nothing to save.",

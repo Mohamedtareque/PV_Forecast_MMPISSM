@@ -159,11 +159,6 @@ def build_reference_kbin_frame(
     return ref_df
 
 
-
-
-
-
-
 def build_reference_fixedgrid_frame(
     csv_path: str,
     site: SiteLocation,
