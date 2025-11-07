@@ -11,8 +11,7 @@ from typing import List, Sequence, Union
 
 PROCESSED_DATA_PATH = "data/processed/dayTime_NAM_dayahead_features_processed.csv"
 TIMESTAMP_COL = "measurement_time"
-USE_KBINS = False
-K_BINS = 60
+
 HISTORY_DAYS = 7
 HORIZON_DAYS = 1
 TARGET_COL = "CSI_ghi"

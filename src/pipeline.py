@@ -11,10 +11,11 @@ from torch.utils.data import DataLoader
 
 from typing import Dict, List, Tuple, Optional, Any
 import logging
+import torch
+from torch.utils.data import TensorDataset, DataLoader
 
 from .utils import DataManager, ExperimentTracker
 from .models import ImprovedLSTM, MATNet
-from .dataset import KBinsDataset
 from .engine import train_model, evaluate_model
 from .config import (
     PROCESSED_DATA_PATH,
@@ -25,15 +26,35 @@ from .config import (
 )
 from .evaluation_utils import (
     SiteLocation,
-    build_reference_kbin_frame,
     build_comparison_table,
-    build_reference_fixedgrid_frame,
     compute_nam_comparison_metrics,
+)
+
+from .utils import (
+    fit_feature_scaler, transform_X_with_scaler,
+    fit_target_scaler, transform_Y_with_scaler
 )
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _fmt_metric(v):
+    if v is None:
+        return "None"
+    # scalar-like
+    if np.isscalar(v):
+        return f"{float(v):.6f}"
+    v = np.asarray(v)
+    if v.ndim == 0:
+        return f"{float(v):.6f}"
+    # small arrays: print values; big arrays: print shape only
+    if v.size <= 10:
+        flat = v.reshape(-1)
+        return "[" + ", ".join(f"{float(x):.6f}" for x in flat) + "]"
+    return f"array{tuple(v.shape)}"
+
 
 # Main Pipeline
 
@@ -52,19 +73,20 @@ class SolarForecastingPipeline:
         self.device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
         self.reference_df = None
         
-    def create_model(self, model_type: str, input_size: int, K_bins: int, horizon_days: int = 1) -> nn.Module:
-        """Create model based on type"""
+    def create_model(self, model_type: str, input_size: int, horizon_days: int = 1, steps_per_day: int = None) -> nn.Module:
         model_config = self.config.get('model_config', {})
-        
+
         if model_type == 'LSTM':
             return ImprovedLSTM(
                 input_size=input_size,
+                steps_per_day=steps_per_day,                                 # <-- NEW
                 hidden_size=model_config.get('hidden_size', 256),
                 num_layers=model_config.get('num_layers', 2),
                 dropout=model_config.get('dropout', 0.2),
-                K_bins=K_bins,
+                bidirectional=model_config.get('bidirectional', True),
                 horizon_days=horizon_days,
-                bidirectional=model_config.get('bidirectional', True)
+                attn_heads=model_config.get('num_heads', 8),                 # optional: aligns with MATNet style
+                use_attention=model_config.get('use_attention', False),      # <-- NEW
             )
         elif model_type == 'MATNet':
             return MATNet(
@@ -73,7 +95,6 @@ class SolarForecastingPipeline:
                 num_heads=model_config.get('num_heads', 8),
                 num_encoder_layers=model_config.get('num_layers', 4),
                 dropout=model_config.get('dropout', 0.2),
-                K_bins=K_bins,
                 horizon_days=horizon_days
             )
         else:
@@ -92,39 +113,48 @@ class SolarForecastingPipeline:
         # Split data
         X_train, Y_train = X[train_idx], Y[train_idx]
         X_val, Y_val = X[val_idx], Y[val_idx]
+
+        # --- Feature scaling (fit on TRAIN only) ---
+        feature_scaler = fit_feature_scaler(X_train)
+        X_train = transform_X_with_scaler(X_train, feature_scaler)
+        X_val   = transform_X_with_scaler(X_val,   feature_scaler)
+
         
-        # Create datasets
-        train_dataset = KBinsDataset(X_train, Y_train, fit_scalers=True)
-        feature_scaler, target_scaler = train_dataset.get_scalers()
+        target_scaler = None
+        if self.config.get("scale_target", False):
+            target_scaler = fit_target_scaler(Y_train)
+            Y_train = transform_Y_with_scaler(Y_train, target_scaler)
+            Y_val   = transform_Y_with_scaler(Y_val,   target_scaler)
+
+        self.scaler_info = {
+            "feature_scaler": feature_scaler,
+            "target_scaler": target_scaler,
+        }
         
-        val_dataset = KBinsDataset(X_val, Y_val, 
-                                  feature_scaler=feature_scaler,
-                                  target_scaler=target_scaler, fit_scalers=False)
         
-        # Create dataloaders
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.config.get('batch_size', 32),
-            shuffle=True,
-            num_workers=2
+
+        train_ds = TensorDataset(
+            torch.from_numpy(X_train).float(),
+            torch.from_numpy(Y_train).float()
         )
-        
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=self.config.get('batch_size', 32),
-            shuffle=False,
-            num_workers=2
+        val_ds = TensorDataset(
+            torch.from_numpy(X_val).float(),
+            torch.from_numpy(Y_val).float()
         )
+
+        train_loader = DataLoader(train_ds, batch_size=self.config["batch_size"], shuffle=True)
+        val_loader   = DataLoader(val_ds,   batch_size=self.config["batch_size"], shuffle=False)
         
         # Create model
-        input_size = X.shape[-1]  # Number of features
-        K_bins = X.shape[2]  # Number of bins
+        input_size   = X.shape[-1]    # features
+        steps_per_day = X.shape[2]    # grid steps per day (e.g., 24, 48)
         horizon_days = Y.shape[1]
+
         model = self.create_model(
             self.config['model_type'],
             input_size,
-            K_bins, 
-            horizon_days
+            horizon_days,
+            steps_per_day=steps_per_day,   # <-- pass it through
         )
         
         logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -148,18 +178,33 @@ class SolarForecastingPipeline:
         }
         
         val_metrics, val_pred, val_true = evaluate_model(
-            model, val_loader, scaler_info, self.device
+            model,
+            val_loader,
+            device=self.device,
+            scaler_info=scaler_info,
         )
 
         comparison_df = None
         if labels_index is not None and reference_df is not None:
             try:
+
+                ref_df = reference_df
+                if isinstance(ref_df.index, pd.DatetimeIndex) and (ref_df.index.name == "target_time"):
+                    tmp = ref_df.reset_index()  # brings 'target_time' as a column
+                    tmp["date"] = tmp["target_time"].dt.normalize()
+                    # Create a simple running bin_id per day in the existing order
+                    tmp["bin_id"] = tmp.groupby("date").cumcount()
+                    # Ensure columns expected downstream exist
+                    if "nam_csi" not in tmp.columns and {"nam_ghi", "clear_sky_ghi"}.issubset(tmp.columns):
+                        tmp["nam_csi"] = tmp["nam_ghi"] / tmp["clear_sky_ghi"]
+                    ref_df = tmp.set_index(["date", "bin_id"]).sort_index()
+
                 comparison_df = build_comparison_table(
                     val_pred,
                     val_true,
                     val_idx,
                     labels_index,
-                    reference_df,
+                    ref_df,          # <-- use the shimmed ref_df
                     fold_id,
                 )
                 nam_metrics = compute_nam_comparison_metrics(comparison_df)
@@ -204,7 +249,7 @@ class SolarForecastingPipeline:
         
         logger.info(f"Fold {fold_id} - Validation Metrics:")
         for metric, value in val_metrics.items():
-            logger.info(f"  {metric}: {value:.6f}")
+            logger.info("  %s: %s", metric, _fmt_metric(value))
         
         return {
             'history': history,
@@ -244,53 +289,28 @@ class SolarForecastingPipeline:
             )
             self.reference_df = None
         else:
-            csv_path = metadata.get("input_csv", PROCESSED_DATA_PATH)
-            k_bins_meta = metadata.get("k_bins", X.shape[2])
-            inferred_k = None
-            if k_bins_meta is not None:
-                try:
-                    inferred_k = int(k_bins_meta)
-                except (TypeError, ValueError):
-                    inferred_k = X.shape[2] # Fallback for K-Bins case
-
-            site_config = SiteLocation(
-                latitude=self.config.get('site_latitude', SITE_LATITUDE),
-                longitude=self.config.get('site_longitude', SITE_LONGITUDE),
-                altitude=self.config.get('site_altitude', SITE_ALTITUDE),
-                timezone=self.config.get('site_timezone', SITE_TIMEZONE),
-            )
+            # Loading Raw data that uesed to cook the X, Y, Labels Tensors.
+            from .evaluation_utils import _load_processed_dataframe
+            csv_path = metadata.get("input_csv", PROCESSED_DATA_PATH) 
+            base_df = _load_processed_dataframe(csv_path) 
 
             try:
-                # --- FIX 2: Add logic to call the correct function ---
-                if inferred_k is not None:
-                    # K-BINS PATH
-                    logger.info(f"Building K-BINS reference frame (K={inferred_k})...")
-                    self.reference_df = build_reference_kbin_frame(
-                        csv_path,
-                        inferred_k,
-                        site_config,
-                    )
-                else:
-                    # FIXED-GRID PATH 
-                    logger.info("Building FIXED-GRID reference frame (K_bins is None)...")
-                    # Make sure you have imported build_reference_fixedgrid_frame
-                    from .evaluation_utils import build_reference_fixedgrid_frame 
-                    ts_col = metadata.get("timestamp_col", "measurement_time")
-                    self.reference_df = build_reference_fixedgrid_frame(
-                        csv_path,
-                        site_config,
-                        timestamp_col=ts_col
-                    )
-                logger.info(
-                    "Reference dataframe prepared for NAM comparison "
-                    "(%d rows).",
-                    len(self.reference_df),
+                from .evaluation_utils import build_reference_from_existing
+                logger.info("Building simple reference from existing columns (no pvlib, no regridding)...")
+                # Use the SAME merged dataframe you used to build arrays (before windowing)
+                # Suppose it's called `merged_df` or `base_df` in your pipeline
+                self.reference_df = build_reference_from_existing(
+                    base_df,                         # <-- your processed/merged modeling df
+                    time_col="measurement_time",
+                    nam_time_col="nam_target_time",
+                    meas_ghi_col="ghi",
+                    nam_ghi_col="nam_ghi",
+                    cs_ghi_col="GHI_cs",
+                    actual_csi_col="CSI_ghi",
                 )
+                logger.info("Reference dataframe prepared (%d rows).", len(self.reference_df))
             except Exception as exc:
-                logger.warning(
-                    "Failed to construct reference dataframe for NAM comparison: %s",
-                    exc,
-                )
+                logger.warning("Failed to construct simple reference: %s", exc)
                 self.reference_df = None
         
         # Load splits

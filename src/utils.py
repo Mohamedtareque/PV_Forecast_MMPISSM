@@ -26,15 +26,39 @@ logger = logging.getLogger(__name__)
 
 
 
-def _jsonable(o):
-    if isinstance(o, (np.floating, np.integer)):
-        return o.item()
-    if isinstance(o, (np.ndarray,)):
-        return o.tolist()
-    return o
+# ---- JSON helpers (recursive, robust) ----
+import numpy as np
+import pandas as pd
+from datetime import datetime, date
+
+def _to_jsonable(obj):
+    """Recursively convert common scientific Python objects to plain JSON types."""
+    # numpy scalars
+    if isinstance(obj, (np.generic,)):                 # covers np.floating, np.integer, etc.
+        return obj.item()
+    # numpy arrays
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    # pandas timestamps / datetimes / dates
+    if isinstance(obj, (pd.Timestamp, datetime, date, np.datetime64)):
+        return str(pd.to_datetime(obj))
+    # torch tensors (just in case)
+    try:
+        import torch
+        if isinstance(obj, torch.Tensor):
+            return obj.detach().cpu().tolist()
+    except Exception:
+        pass
+    # dict / list / tuple / set
+    if isinstance(obj, dict):
+        return {k: _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_jsonable(v) for v in obj]
+    # anything else that's already JSON-safe (str, int, float, bool, None)
+    return obj
 
 def _jsonable_dict(d):
-    return {k: _jsonable(v) for k, v in d.items()}
+    return {k: _to_jsonable(v) for k, v in d.items()}
 
 
 class DataManager:
@@ -55,7 +79,7 @@ class DataManager:
         X: np.ndarray,
         Y: np.ndarray,
         labels: Optional[pd.DataFrame] = None,
-        filename_prefix: str = "kbins_data",
+        filename_prefix: str = "fixedgrid_data",
         feature_cols: Optional[List[str]] = None,
         target_col: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
@@ -230,7 +254,7 @@ class ExperimentTracker:
         """
         self.config = config
         with open(self.exp_dir / "config.json", 'w') as f:
-            json.dump(config, f, indent=2)
+            json.dump(_to_jsonable(config), f, indent=2)
     
     def save_model(self, model: nn.Module, fold: int = 0, is_best: bool = False):
         """Save model weights"""
@@ -504,6 +528,7 @@ class ExperimentTracker:
         plt.close()
     
     def summarize_results(self):
+
         """Generate summary of all folds.
         Provide the final, high-level summary of the entire experiment, especially when using cross-validation.
 
@@ -544,6 +569,43 @@ class ExperimentTracker:
         
         # Save summary
         with open(self.exp_dir / "summary.json", 'w') as f:
-            json.dump(_jsonable(summary), f, indent=2)  
+            json.dump(_to_jsonable(summary), f, indent=2) 
         
         return summary
+    
+
+
+
+from sklearn.preprocessing import StandardScaler
+
+def fit_feature_scaler(X: np.ndarray) -> StandardScaler:
+    """
+    X shape: (N, history_days, steps_per_day, F)  → flattens all time dims,
+    fits a single scaler per feature using *train only*.
+    """
+    F = X.shape[-1]
+    X2d = X.reshape(-1, F)              # (N*D*K, F)
+    scaler = StandardScaler()
+    scaler.fit(X2d)
+    return scaler
+
+def transform_X_with_scaler(X: np.ndarray, scaler: StandardScaler) -> np.ndarray:
+    F = X.shape[-1]
+    X2d = X.reshape(-1, F)              # (N*D*K, F)
+    X2d = scaler.transform(X2d)
+    return X2d.reshape(*X.shape)
+
+def fit_target_scaler(Y: np.ndarray) -> StandardScaler:
+    """
+    Y shape: (N, horizon_days, steps_per_day) or (N, H, K, T)
+    If target is 1 variable per time step, flatten to (-1, 1).
+    """
+    y = Y.reshape(-1, 1)
+    scaler = StandardScaler()
+    scaler.fit(y)
+    return scaler
+
+def transform_Y_with_scaler(Y: np.ndarray, scaler: StandardScaler) -> np.ndarray:
+    y = Y.reshape(-1, 1)
+    y_s = scaler.transform(y)
+    return y_s.reshape(*Y.shape)

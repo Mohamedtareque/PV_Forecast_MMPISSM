@@ -52,20 +52,32 @@ def _load_processed_dataframe(
     if drop_columns:
         df = df.drop(columns=list(drop_columns), errors="ignore")
 
-    # --- FIX 2: Force all known numeric columns to be numbers ---
-    # This list should include all features + targets
-    numeric_cols = [
-        'CSI_ghi', 'CSI_dni', 'nam_ghi', 'nam_dni', 'nam_cc',
-        'solar_zenith', 'time_gap_hours', 'time_gap_norm', 'day_boundary_flag',
-        'hour_progression', 'absolute_hour', 'season_flag',
-        'hour_sin', 'hour_cos', 'month_sin', 'month_cos'
-    ]
+    # # --- FIX 2: Force all known numeric columns to be numbers ---
+    # # This list should include all features + targets
+    # numeric_cols = ['ghi', 'dni', 'solar_zenith', 'time_gap_hours', 'time_gap_norm',
+    #    'day_boundary_flag', 'hour_progression', 'absolute_hour', 'GHI_cs',
+    #    'DNI_cs', 'CSI_ghi', 'CSI_dni', 'season_flag', 'hour_sin', 'hour_cos',
+    #    'month_sin', 'month_cos', 'nam_ghi', 'nam_dni', 'nam_cc',
+    # ,'B_CSI_ghi_8h', 'V_CSI_ghi_8h', 'L_CSI_ghi_8h',
+    #    'B_CSI_ghi_9h', 'V_CSI_ghi_9h', 'L_CSI_ghi_9h', 'B_CSI_ghi_10h',
+    #    'V_CSI_ghi_10h', 'L_CSI_ghi_10h', 'B_CSI_ghi_11h', 'V_CSI_ghi_11h',
+    #    'L_CSI_ghi_11h', 'B_CSI_ghi_12h', 'V_CSI_ghi_12h', 'L_CSI_ghi_12h',
+    #    'B_CSI_ghi_13h', 'V_CSI_ghi_13h', 'L_CSI_ghi_13h', 'B_CSI_ghi_14h',
+    #    'V_CSI_ghi_14h', 'L_CSI_ghi_14h', 'B_CSI_ghi_15h', 'V_CSI_ghi_15h',
+    #    'L_CSI_ghi_15h', 'B_CSI_ghi_16h', 'V_CSI_ghi_16h', 'L_CSI_ghi_16h',
+    #    'B_CSI_ghi_17h', 'V_CSI_ghi_17h', 'L_CSI_ghi_17h', 'B_CSI_ghi_18h',
+    #    'V_CSI_ghi_18h', 'L_CSI_ghi_18h', 'B_CSI_ghi_19h', 'V_CSI_ghi_19h',
+    #    'L_CSI_ghi_19h', '80_dwsw', '80_cloud_cover', '56_dwsw',
+    #    '56_cloud_cover', '20_dwsw', '20_cloud_cover', '88_dwsw',
+    #    '88_cloud_cover', 'AVG(R)', 'STD(R)', 'ENT(R)', 'AVG(G)', 'STD(G)',
+    #    'ENT(G)', 'AVG(B)', 'STD(B)', 'ENT(B)', 'AVG(RB)', 'STD(RB)', 'ENT(RB)',
+    #    'AVG(NRB)', 'STD(NRB)', 'ENT(NRB)']
     
-    # This loop converts all string numbers to floats
-    # and all non-numeric strings (like "N/A") to NaN
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+    # # This loop converts all string numbers to floats
+    # # and all non-numeric strings (like "N/A") to NaN
+    # for col in numeric_cols:
+    #     if col in df.columns:
+    #         df[col] = pd.to_numeric(df[col], errors='coerce')
 
     df = df.sort_values("measurement_time")
     df = df.set_index("measurement_time")
@@ -74,170 +86,53 @@ def _load_processed_dataframe(
     return df
 
 
-def build_reference_kbin_frame(
-    csv_path: str,
-    k_bins: int,
-    site: SiteLocation,
-) -> pd.DataFrame:
+
+
+def build_reference_from_existing(
+    df: pd.DataFrame,
+    time_col: str = "measurement_time",         # your main UTC timestamp
+    nam_time_col: str = "nam_target_time",      # NAM valid time (if present)
+    meas_ghi_col: str = "ghi",
+    nam_ghi_col: str = "nam_ghi",
+    cs_ghi_col: str = "GHI_cs",                 # clear-sky already in your data
+    actual_csi_col: str = "CSI_ghi",            # if present
+):
     """
-    Reconstruct the K-bin normalised dataframe used to create the model arrays.
-
-    Returns
-    -------
-    pd.DataFrame
-        MultiIndex [date, bin_id, target_time] with columns that include the
-        original features plus clear-sky irradiance, actual/NAM GHI and CSI.
+    Construct a reference frame from already prepared columns in df.
+    No re-gridding, no pvlib; uses existing clear-sky & NAM columns.
+    Index = UTC tz-aware 'target_time' (NAM valid time if available, else measurement_time).
     """
-    from .preprocessing import KBinConfig, process_splits_to_kbins
+    # 1) Normalize timestamps to tz-aware UTC
+    def _to_utc_series(s):
+        s = pd.to_datetime(s, utc=True, errors="coerce")
+        return s
 
-    base_df = _load_processed_dataframe(
-        csv_path,
-        tz=site.timezone,
-        drop_columns=["nam_target_time", "forecast_issue_time", 'issue_time', 'horizon'],
-    )
+    has_nam_time = nam_time_col in df.columns
+    target_time = _to_utc_series(df[nam_time_col] if has_nam_time else df[time_col])
 
-    cfg = KBinConfig(K=k_bins, tz=site.timezone)
-    # processed = process_splits_to_kbins({"reference": base_df}, cfg)
-    # ref_df = processed.get("reference", pd.DataFrame())
-    if k_bins is not None:
-        # --- K-BINS PATH ---
-        cfg = KBinConfig(K=k_bins, tz=site.timezone)
-        processed = process_splits_to_kbins({"reference": base_df}, cfg)
-        ref_df = processed.get("reference", pd.DataFrame())
-    else:
-        # --- FIXED-GRID PATH ---
-        from .preprocessing import to_fixedgrid_multiindex
-        logger.info(f"Building FIXED-GRID reference frame (K_bins is None)")
-        # We need to find the timestamp_col from the metadata
-        # For now, assume it's "measurement_time" as in your notebook
-        ref_df = to_fixedgrid_multiindex(base_df, timestamp_col="measurement_time")
+    # 2) Build reference on this single time key
+    ref = pd.DataFrame(index=pd.Index(target_time, name="target_time"))
+    ref = ref[~ref.index.duplicated(keep="first")].sort_index()
 
-    if ref_df.empty:
-        raise ValueError(
-            "Reference dataframe is empty after K-bin processing. "
-            "Verify the processed CSV contains the expected columns."
-        )
+    # 3) Attach columns that already exist
+    def _attach(colname, outname=None):
+        if colname in df.columns:
+            s = pd.Series(df[colname].values, index=ref.index)
+            ref[outname or colname] = s
 
-    ref_df = ref_df.copy()
-    target_times = ref_df.index.get_level_values("target_time").unique()
+    _attach(meas_ghi_col,  "actual_ghi")
+    _attach(nam_ghi_col,   "nam_ghi")
+    _attach(cs_ghi_col,    "clear_sky_ghi")
+    _attach(actual_csi_col, "actual_csi")  # optional if you already computed CSI
 
-    location = pvlib.location.Location(
-        latitude=site.latitude,
-        longitude=site.longitude,
-        altitude=site.altitude,
-        tz=site.timezone,
-    )
+    # 4) Compute nam_csi if possible
+    if "nam_ghi" in ref.columns and "clear_sky_ghi" in ref.columns:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ref["nam_csi"] = ref["nam_ghi"] / ref["clear_sky_ghi"]
+            ref["nam_csi"].replace([np.inf, -np.inf], np.nan, inplace=True)
+    ref.fillna(0, inplace=True)
 
-    clearsky = location.get_clearsky(target_times)
-    ghi_cs = clearsky["ghi"].reindex(target_times)
-    dni_cs = clearsky["dni"].reindex(target_times)
-    dhi_cs = clearsky.get("dhi")
-    if dhi_cs is not None:
-        dhi_cs = dhi_cs.reindex(target_times)
-
-    ref_df["clear_sky_ghi"] = ghi_cs.reindex(
-        ref_df.index.get_level_values("target_time")
-    ).to_numpy()
-    ref_df["clear_sky_dni"] = dni_cs.reindex(
-        ref_df.index.get_level_values("target_time")
-    ).to_numpy()
-    if dhi_cs is not None:
-        ref_df["clear_sky_dhi"] = dhi_cs.reindex(
-            ref_df.index.get_level_values("target_time")
-        ).to_numpy()
-
-    ref_df["actual_csi"] = ref_df["CSI_ghi"]
-    ref_df["actual_ghi"] = ref_df["actual_csi"] * ref_df["clear_sky_ghi"]
-
-    valid_mask = ref_df["clear_sky_ghi"] > 1e-6
-    ref_df["nam_csi"] = np.where(
-        valid_mask,
-        ref_df["nam_ghi"] / ref_df["clear_sky_ghi"],
-        np.nan,
-    )
-
-    return ref_df
-
-
-def build_reference_fixedgrid_frame(
-    csv_path: str,
-    site: SiteLocation,
-    timestamp_col: str = "measurement_time",
-) -> pd.DataFrame:
-    """
-    Builds a reference dataframe for fixed-grid (non-K-Binned) data.
-    """
-    base_df = _load_processed_dataframe(
-        csv_path,
-        tz=site.timezone,
-        drop_columns=["nam_target_time", "forecast_issue_time", 'issue_time',  'horizon'],
-    )
-    
-    # Use to_fixedgrid_multiindex instead of K-Bin processing
-    # Note: reset_index() so timestamp_col is a column
-    ref_df = to_fixedgrid_multiindex(
-        base_df.reset_index(), 
-        timestamp_col=timestamp_col
-    )
-
-    if ref_df.empty:
-        raise ValueError(
-            "Reference dataframe is empty after fixed-grid processing."
-        )
-
-    ref_df = ref_df.copy()
-    
-    # Get all unique timestamps from the 'target_time' column
-    # In fixed-grid, 'target_time' is not in the index, so we get it from the column
-    if "target_time" not in ref_df.columns:
-        # If 'target_time' isn't a column, the original timestamps are the index
-        # We need to get the timestamps *from* the index created by to_fixedgrid_multiindex
-        # This is complex. A simpler way is to re-add target_time from the original index.
-        base_df.index.name = "target_time"
-        ref_df = ref_df.join(base_df["target_time"])
-        if ref_df["target_time"].isnull().any():
-             logger.warning("Could not rejoin target_time in fixed-grid reference.")
-
-    # Get unique timestamps for clear-sky calculation
-    # We must handle the index [date, bin_id] vs. the column 'target_time'
-    if "target_time" in ref_df.columns:
-         target_times = ref_df["target_time"].unique()
-    else:
-         # Fallback, this might not be correct if index is not timestamp
-         try:
-             target_times = ref_df.index.get_level_values("target_time").unique()
-         except:
-             raise ValueError("Cannot find 'target_time' in fixed-grid reference frame.")
-
-
-    location = pvlib.location.Location(
-        latitude=site.latitude,
-        longitude=site.longitude,
-        altitude=site.altitude,
-        tz=site.timezone,
-    )
-    
-    # Get clear-sky data
-    clearsky = location.get_clearsky(target_times)
-    
-    # Map clear-sky data back to the dataframe
-    cs_map = clearsky['ghi'].to_dict()
-    ref_df["clear_sky_ghi"] = ref_df["target_time"].map(cs_map)
-    cs_map_dni = clearsky['dni'].to_dict()
-    ref_df["clear_sky_dni"] = ref_df["target_time"].map(cs_map_dni)
-    
-    # ... (the rest is the same as build_reference_kbin_frame) ...
-    ref_df["actual_csi"] = ref_df["CSI_ghi"]
-    ref_df["actual_ghi"] = ref_df["actual_csi"] * ref_df["clear_sky_ghi"]
-
-    valid_mask = ref_df["clear_sky_ghi"] > 1e-6
-    ref_df["nam_csi"] = np.where(
-        valid_mask,
-        ref_df["nam_ghi"] / ref_df["clear_sky_ghi"],
-        np.nan,
-    )
-
-    return ref_df
+    return ref
 
 def _metric_rmse(pred: np.ndarray, truth: np.ndarray) -> float:
     return float(np.sqrt(np.nanmean((pred - truth) ** 2)))

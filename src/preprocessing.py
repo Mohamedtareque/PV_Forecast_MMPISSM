@@ -37,47 +37,6 @@ class SplitData:
     val: Optional[pd.DataFrame] = None
     test: Optional[pd.DataFrame] = None
 
-@dataclass
-class KBinConfig:
-    K: int = 60
-    tz: Optional[str] = None 
-    use_pchip: bool = True
-    irradiance_mode: str = "pchip_renorm"  # "pchip_renorm" | "conservative" | "hold"
-    clamp_irradiance_nonneg: bool = True
-    post_smooth_window: int = 0  # >0 only when irradiance_mode="conservative"
-
-
-DEFAULT_STRATEGY = {
-    "ghi": "irradiance",
-    "dni": "irradiance",
-    "CSI_ghi": "irradiance",
-    "CSI_dni": "irradiance",
-
-    "air_temp": "continuous",
-    "relhum": "continuous",
-    "windsp": "continuous",
-
-    "solar_zenith": "continuous",
-    "solar_elevation": "continuous",
-    "GHI_cs": "continuous",
-    "DNI_cs": "continuous",
-
-    "winddirection_sin": "windvec",
-    "winddirection_cos": "windvec",
-
-    "season_flag": "categorical",
-    "is_daylight": "categorical",
-    "day_boundary_flag": "categorical",
-
-    "hour_sin": "temporal_recompute",
-    "hour_cos": "temporal_recompute",
-    "month_sin": "temporal_recompute",
-    "month_cos": "temporal_recompute",
-    "absolute_hour": "temporal_recompute",
-    "hour_progression": "temporal_recompute",
-    "time_gap_hours": "temporal_recompute",
-    "time_gap_norm": "temporal_recompute",
-}
 
 
 def ensure_datetime_index(df: pd.DataFrame, timestamp_col: Optional[str]=None, tz: Optional[str]=None) -> pd.DataFrame:
@@ -335,106 +294,6 @@ def normalize_day_to_kbins(df_day: pd.DataFrame, K: int, cfg, strategy_map=None)
 
 
 
-def process_splits_to_kbins(
-    splits: Union[Dict[str, pd.DataFrame], SplitData],
-    cfg: KBinConfig,
-    feature_cols: Optional[Iterable[str]] = None,
-    strategy_map: Optional[Dict[str, str]] = None
-) -> Dict[str, pd.DataFrame]:
-    """models like Recurrent Neural Networks (RNNs) or Transformers that often expect fixed-size input sequences. 
-    The function takes raw, continuous time-series data and resamples it into a fixed number of K bins for each day.
-
-    •	Groups the time series by day.
-	•	Maps each day's daylight to K equal bins (0…K-1).
-	•	Rebuilds the DataFrame with MultiIndex (date, bin_id), sorted.
-	•	Ensures the same per-day length (K) for all days.
-	•	Returns a per-split normalized DataFrame that build_model_arrays can consume directly.
-
-    Args:
-        splits (Union[Dict[str, pd.DataFrame], SplitData]): This argument accepts time-series data, typically divided into sets like 'train', 'validation', and 'test'. 
-        it can be a dictionary mapping split names to pandas DataFrames or a custom SplitData class.
-        cfg (KBinConfig): A configuration object that holds key parameters for the binning process.
-        feature_cols (Optional[Iterable[str]], optional): optional arguments for more granular control, likely used by the downstream function normalize_day_to_kbins. 
-        it is the list of columns that will be used as model inputs (the predictors).Defaults to None.
-        strategy_map (Optional[Dict[str, str]], optional): allow specifying different aggregation methods (e.g., 'mean' for a temperature sensor, 'last' for a state indicator) for different columns during binning.. Defaults to None.
-
-    Raises:
-        ValueError: TO BE FILLED
-
-    Returns:
-        Dict[str, pd.DataFrame]: return a dictionary where keys are the split names and values are the processed DataFrames.
-    """
-    # Adapter design pattern
-    # 'splits' can be one of two types.
-    # 1. A dictionary: {'train': df_train, 'val': df_val}
-    # 2. A SplitData object: SplitData(train=df_train, val=df_val)
-    if isinstance(splits, dict):
-        data_dict = splits
-    else:
-        data_dict = {k: v for k, v in splits.__dict__.items() if v is not None}
-
-    # Iteration and Validation
-    out: Dict[str, pd.DataFrame] = {}
-    for name, df in data_dict.items():
-        # Emptiness Check
-        if df is None or df.empty:
-            out[name] = pd.DataFrame()
-            continue
-        # Index Type Check, crucial
-        if not isinstance(df.index, pd.DatetimeIndex):
-            raise ValueError(f"{name} split must have a DateTimeIndex.")
-        # Timezone Standardization, UTC is the standard
-        if cfg.tz is not None:
-            df = ensure_datetime_index(df, tz=cfg.tz)
-
-        if feature_cols is not None: 
-            requested_cols = list(dict.fromkeys(feature_cols))
-            missing_cols = [c for c in requested_cols if c not in df.columns]
-            if missing_cols:
-                raise KeyError(
-                    f"Columns missing in split '{name}': {missing_cols}. "
-                    "Verify the dataset contains all requested features/target."
-                )
-            df = df[requested_cols].copy()
-
-
-        # Daily Processing Loop
-        blocks = []
-        # guarantee chronological order before grouping. and groups all records by their calendar date.
-        for date_key, df_day in df.sort_index().groupby(df.index.date, sort=True):
-            # skips days with insufficient data.
-            if len(df_day) < 2:
-                continue
-            # resampling the day's data into K bins
-            day_block = normalize_day_to_kbins(df_day, cfg.K, cfg, strategy_map=strategy_map)
-
-            # Indexing and Structuring
-            # takes the binned data for a single day (day_block) and engineers a well-structured MultiIndex
-            # The Date: Which day did this data come from?
-            # The Bin ID: Which time bin within that day (e.g., bin 1, bin 2, ... bin K)?
-            # The Target Time: What is the exact timestamp for that bin?
-            # [date, bin_id, target_time]
-            if not day_block.empty:
-                # Ensure the time index is named so we can reorder by name
-                if day_block.index.name is None:
-                    day_block.index.name = "target_time"
-
-                # Add BOTH bin_id and date into the index
-                day_block.insert(0, "date", pd.to_datetime(date_key))
-                day_block = day_block.set_index(["bin_id", "date"], append=True)
-
-                # Reorder to [date, bin_id, target_time] exactly
-                day_block.index = day_block.index.reorder_levels(["date", "bin_id", "target_time"])
-                # Operations on a sorted MultiIndex can be orders of magnitude faster than on an unsorted one.
-                day_block = day_block.sort_index()
-
-                blocks.append(day_block)
-
-        out[name] = pd.concat(blocks) if blocks else pd.DataFrame()
-
-    return out
-
-
 # ------ Validation ------
 # The goal is to quantify how much information is lost when you compress the original high-resolution (e.g., hourly) data into a fixed number of bins (K).
 def _reconstruct_hourly_from_kbins(k_series: pd.Series, n_hours: int) -> pd.Series:
@@ -605,8 +464,8 @@ def _tensor_from_norm(norm_df: pd.DataFrame, feature_cols: List[str]):
         )
 
         X[:, :, j] = mat.values # takes the 2D matrix of data for the current feature and slots it perfectly into its designated "slice" of the final 3D tensor X.
-
-    return X, dates
+        X_imputed_zero = np.nan_to_num(X, nan=0.0)
+    return X_imputed_zero, dates
 
 
 

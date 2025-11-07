@@ -20,10 +20,57 @@ import pickle
 from pathlib import Path
 import logging
 import torch
-
+import torch.nn.functional as F 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# --- add these helpers near the top of engine.py ---
+
+def _move_to_device(obj, device):
+    """Recursively move tensors (or collections of tensors) to device."""
+    if torch.is_tensor(obj):
+        return obj.to(device)
+    if isinstance(obj, dict):
+        return {k: _move_to_device(v, device) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_move_to_device(v, device) for v in obj)
+    return obj  # leave non-tensors as-is
+
+def _extract_xy(batch):
+    """
+    Accept (X, Y), [X, Y], or dict with common keys.
+    Returns (X_tensor, Y_tensor).
+    """
+    # tuple/list
+    if isinstance(batch, (list, tuple)) and len(batch) == 2:
+        return batch[0], batch[1]
+
+    # dict patterns
+    if isinstance(batch, dict):
+        # feature keys to try
+        x_keys = ("X", "x", "features", "inputs", "data")
+        y_keys = ("Y", "y", "target", "labels")
+
+        Xb = None
+        for k in x_keys:
+            if k in batch:
+                Xb = batch[k]
+                break
+        Yb = None
+        for k in y_keys:
+            if k in batch:
+                Yb = batch[k]
+                break
+
+        if Xb is not None and Yb is not None:
+            return Xb, Yb
+
+    raise TypeError(
+        "Batch format not recognized. Expected (X, Y) or dict with keys like "
+        "{'X'/'features', 'Y'/'target'}."
+    )
 
 # Training Functions
 
@@ -67,49 +114,48 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
         train_mae = 0.0
         train_batches = 0
         
-        for batch_x, batch_y in train_loader:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-            
+
+        for batch in train_loader:
+            Xb, Yb = _extract_xy(batch)
+            Xb, Yb = _move_to_device(Xb, device), _move_to_device(Yb, device)
+
             optimizer.zero_grad()
-            outputs = model(batch_x)
-            loss = criterion(outputs, batch_y)
-            
+            outputs = model(Xb)
+            loss = criterion(outputs, Yb)
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            
+
             train_loss += loss.item()
-            train_mae += mean_absolute_error(
-                batch_y.cpu().numpy().flatten(),
-                outputs.detach().cpu().numpy().flatten()
-            )
+            # safer & faster than sklearn per-batch
+            train_mae  += F.l1_loss(outputs, Yb).item()
             train_batches += 1
-        
+
+
         # Validation
         model.eval()
         val_loss = 0.0
         val_mae = 0.0
         val_batches = 0
-        
+
         with torch.no_grad():
-            for batch_x, batch_y in val_loader:
-                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-                
-                outputs = model(batch_x)
-                loss = criterion(outputs, batch_y)
-                
+            for batch in val_loader:
+                Xb, Yb = _extract_xy(batch)
+                Xb, Yb = _move_to_device(Xb, device), _move_to_device(Yb, device)
+
+                outputs = model(Xb)
+                loss = criterion(outputs, Yb)
+
                 val_loss += loss.item()
-                val_mae += mean_absolute_error(
-                    batch_y.cpu().numpy().flatten(),
-                    outputs.cpu().numpy().flatten()
-                )
+                val_mae  += F.l1_loss(outputs, Yb).item()
                 val_batches += 1
         
         # Calculate averages
-        avg_train_loss = train_loss / train_batches
-        avg_val_loss = val_loss / val_batches
-        avg_train_mae = train_mae / train_batches
-        avg_val_mae = val_mae / val_batches
+        avg_train_loss = train_loss / max(train_batches, 1)
+        avg_val_loss   = val_loss   / max(val_batches, 1)
+        avg_train_mae  = train_mae  / max(train_batches, 1)
+        avg_val_mae    = val_mae    / max(val_batches, 1)
         current_lr = optimizer.param_groups[0]['lr']
         
         # Store history
@@ -150,61 +196,57 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
     return history
 
 
-def evaluate_model(model: nn.Module, data_loader: DataLoader,
-                  scaler_info: Optional[Dict] = None,
-                  device: str = 'cpu') -> Tuple[Dict, np.ndarray, np.ndarray]:
-    """Evaluate model and return metrics"""
-    
-    device = torch.device(device)
-    model = model.to(device)
+# engine.py
+import numpy as np
+import torch
+
+def _maybe_inverse_scale(y, scaler):
+    if scaler is None:
+        return y
+    y2 = y.reshape(-1, 1)
+    y2 = scaler.inverse_transform(y2).reshape(*y.shape)
+    return y2
+
+def _compute_metrics(y_true, y_pred, eps=1e-8):
+    # Works for shapes (N,H,K) or (N,H,K,1); squeeze last dim if singleton
+    if y_true.ndim == 4 and y_true.shape[-1] == 1:
+        y_true = y_true[..., 0]
+    if y_pred.ndim == 4 and y_pred.shape[-1] == 1:
+        y_pred = y_pred[..., 0]
+
+    mae  = np.mean(np.abs(y_pred - y_true))
+    rmse = np.sqrt(np.mean((y_pred - y_true) ** 2))
+    # safe MAPE for irradiance/CSI-like targets
+    mape = np.mean(np.abs((y_pred - y_true) / (np.clip(np.abs(y_true), eps, None))))
+    # per-horizon (if H>1)
+    per_h_mae = np.mean(np.abs(y_pred - y_true), axis=(0,2)) if y_true.ndim == 3 else None
+    return {"MAE": float(mae), "RMSE": float(rmse), "MAPE": float(mape),
+            "per_horizon_MAE": per_h_mae}
+
+def evaluate(model, loader, scaler_info=None, device="cuda"):
+    device = torch.device(device) if not isinstance(device, torch.device) else device
     model.eval()
-    
-    all_predictions = []
-    all_targets = []
-    
+    y_true_all, y_pred_all = [], []
+
     with torch.no_grad():
-        for batch_x, batch_y in data_loader:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-            
-            outputs = model(batch_x)
-            
-            all_predictions.append(outputs.cpu().numpy())
-            all_targets.append(batch_y.cpu().numpy())
-    
-    # Concatenate all batches
-    predictions = np.concatenate(all_predictions, axis=0)
-    targets = np.concatenate(all_targets, axis=0)
-    
-    # Denormalize if scaler provided
-    if scaler_info and 'target_scaler' in scaler_info:
-        scaler = scaler_info['target_scaler']
-        predictions_flat = predictions.reshape(-1, 1)
-        targets_flat = targets.reshape(-1, 1)
-        
-        predictions = scaler.inverse_transform(predictions_flat).reshape(predictions.shape)
-        targets = scaler.inverse_transform(targets_flat).reshape(targets.shape)
-    
-    # Flatten for metrics calculation
-    predictions_flat = predictions.flatten()
-    targets_flat = targets.flatten()
-    
-    # Calculate metrics
-    mse  = mean_squared_error(targets_flat, predictions_flat)
-    rmse = np.sqrt(mse)
-    mae  = mean_absolute_error(targets_flat, predictions_flat)
-    r2   = r2_score(targets_flat, predictions_flat)
+        for batch in loader:
+            Xb, Yb = _extract_xy(batch)                       # <— use helper
+            Xb, Yb = _move_to_device(Xb, device), _move_to_device(Yb, device)
+            Pb = model(Xb)
+            y_true_all.append(Yb.detach().cpu().numpy())
+            y_pred_all.append(Pb.detach().cpu().numpy())
 
-    metrics = {
-        'mse':  float(mse),
-        'rmse': float(rmse),
-        'mae':  float(mae),
-        'r2':   float(r2),
-    }
+    y_true = np.concatenate(y_true_all, axis=0)
+    y_pred = np.concatenate(y_pred_all, axis=0)
 
-    mask = np.abs(targets_flat) > 1e-6
-    if mask.any():
-        mape = np.mean(np.abs((targets_flat[mask] - predictions_flat[mask]) / targets_flat[mask])) * 100.0
-        metrics['mape'] = float(mape)
-    
-    return metrics, predictions, targets
+    ts = (scaler_info or {}).get("target_scaler", None)
+    y_true = _maybe_inverse_scale(y_true, ts)
+    y_pred = _maybe_inverse_scale(y_pred, ts)
+
+    metrics = _compute_metrics(y_true, y_pred)
+    return {"metrics": metrics, "y_true": y_true, "y_pred": y_pred}
+
+def evaluate_model(model, loader, device="cuda", scaler_info=None):
+    out = evaluate(model, loader, scaler_info=scaler_info, device=device)
+    return out["metrics"], out["y_pred"], out["y_true"]
 
