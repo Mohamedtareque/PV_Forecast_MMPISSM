@@ -32,6 +32,7 @@ class ImprovedLSTM(nn.Module):
         hidden_size: int = 256,
         num_layers: int = 2,
         dropout: float = 0.2,
+        activation_function:str = "ReLU",
         bidirectional: bool = True,
         horizon_days: int = 1,
         attn_heads: int = 8,
@@ -73,10 +74,21 @@ class ImprovedLSTM(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+        # --- CHANGED 1: Create activation function object ---
+        if activation_function == "ReLU":
+            self.activation = nn.ReLU()
+        elif activation_function == "Tanh":
+            self.activation = nn.Tanh()
+        elif activation_function == "LeakyReLU":
+            self.activation = nn.LeakyReLU()
+        else:
+            raise ValueError(f"Unsupported activation function: {activation_function}")
+        # ----------------------------------------------------
+
         # Final output projection
         self.output_projection = nn.Sequential(
             nn.Linear(hidden_size * self.num_directions, hidden_size),
-            nn.ReLU(),
+            self.activation,
             nn.Dropout(dropout),
             nn.Linear(hidden_size, self.horizon_days * self.steps_per_day),
         )

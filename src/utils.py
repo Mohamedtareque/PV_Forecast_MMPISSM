@@ -61,6 +61,11 @@ def _jsonable_dict(d):
     return {k: _to_jsonable(v) for k, v in d.items()}
 
 
+# utils.py
+import numpy as np
+import pandas as pd
+
+
 class DataManager:
     """Handles data saving, loading, and split management.
     
@@ -576,36 +581,30 @@ class ExperimentTracker:
 
 
 
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
-def fit_feature_scaler(X: np.ndarray) -> StandardScaler:
-    """
-    X shape: (N, history_days, steps_per_day, F)  → flattens all time dims,
-    fits a single scaler per feature using *train only*.
-    """
-    F = X.shape[-1]
-    X2d = X.reshape(-1, F)              # (N*D*K, F)
-    scaler = StandardScaler()
-    scaler.fit(X2d)
+def fit_feature_scaler(X: np.ndarray):
+    # X: (N, H, T, F) -> fit per-feature across all samples/steps
+    N, H, T, F = X.shape
+    flat = X.reshape(-1, F)
+    scaler = MinMaxScaler(feature_range=(-1, 1))
+    scaler.fit(flat)
     return scaler
 
-def transform_X_with_scaler(X: np.ndarray, scaler: StandardScaler) -> np.ndarray:
-    F = X.shape[-1]
-    X2d = X.reshape(-1, F)              # (N*D*K, F)
-    X2d = scaler.transform(X2d)
-    return X2d.reshape(*X.shape)
+def transform_X_with_scaler(X: np.ndarray, scaler):
+    N, H, T, F = X.shape
+    flat = X.reshape(-1, F)
+    flat_tr = scaler.transform(flat)
+    return flat_tr.reshape(N, H, T, F)
 
-def fit_target_scaler(Y: np.ndarray) -> StandardScaler:
-    """
-    Y shape: (N, horizon_days, steps_per_day) or (N, H, K, T)
-    If target is 1 variable per time step, flatten to (-1, 1).
-    """
-    y = Y.reshape(-1, 1)
-    scaler = StandardScaler()
-    scaler.fit(y)
+def fit_target_scaler(Y: np.ndarray):
+    # Y: (N, H=1, T) or (N, H, T) -> scale as a single channel
+    flat = Y.reshape(-1, 1)
+    scaler = MinMaxScaler(feature_range=(-1, 1))
+    scaler.fit(flat)
     return scaler
 
-def transform_Y_with_scaler(Y: np.ndarray, scaler: StandardScaler) -> np.ndarray:
-    y = Y.reshape(-1, 1)
-    y_s = scaler.transform(y)
-    return y_s.reshape(*Y.shape)
+def transform_Y_with_scaler(Y: np.ndarray, scaler):
+    flat = Y.reshape(-1, 1)
+    flat_tr = scaler.transform(flat)
+    return flat_tr.reshape(*Y.shape)

@@ -35,25 +35,27 @@ from .utils import (
     fit_target_scaler, transform_Y_with_scaler
 )
 
+from src.benchmarking import run_benchmark_report
+
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def _fmt_metric(v):
-    if v is None:
-        return "None"
-    # scalar-like
-    if np.isscalar(v):
-        return f"{float(v):.6f}"
-    v = np.asarray(v)
-    if v.ndim == 0:
-        return f"{float(v):.6f}"
-    # small arrays: print values; big arrays: print shape only
-    if v.size <= 10:
-        flat = v.reshape(-1)
-        return "[" + ", ".join(f"{float(x):.6f}" for x in flat) + "]"
-    return f"array{tuple(v.shape)}"
+# def _fmt_metric(v):
+#     if v is None:
+#         return "None"
+#     # scalar-like
+#     if np.isscalar(v):
+#         return f"{float(v):.6f}"
+#     v = np.asarray(v)
+#     if v.ndim == 0:
+#         return f"{float(v):.6f}"
+#     # small arrays: print values; big arrays: print shape only
+#     if v.size <= 10:
+#         flat = v.reshape(-1)
+#         return "[" + ", ".join(f"{float(x):.6f}" for x in flat) + "]"
+#     return f"array{tuple(v.shape)}"
 
 
 # Main Pipeline
@@ -71,7 +73,11 @@ class SolarForecastingPipeline:
             experiment_name=config.get('experiment_name', 'solar_forecast')
         )
         self.device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
-        self.reference_df = None
+        # Optional: provide the full fixed-grid dataframe used to build arrays.
+        # This lets us compute NAM and Naive baselines aligned to target timestamps.
+        self.reference_df = None  # set this from the runner: pipeline.reference_df = fixed_df
+        # Where to save benchmark comparison CSVs/plots
+        self.benchmark_dirname = "benchmarks"
         
     def create_model(self, model_type: str, input_size: int, horizon_days: int = 1, steps_per_day: int = None) -> nn.Module:
         model_config = self.config.get('model_config', {})
@@ -83,6 +89,7 @@ class SolarForecastingPipeline:
                 hidden_size=model_config.get('hidden_size', 256),
                 num_layers=model_config.get('num_layers', 2),
                 dropout=model_config.get('dropout', 0.2),
+                activation_function=model_config.get('activation_function', "ReLU"),
                 bidirectional=model_config.get('bidirectional', True),
                 horizon_days=horizon_days,
                 attn_heads=model_config.get('num_heads', 8),                 # optional: aligns with MATNet style
@@ -120,11 +127,16 @@ class SolarForecastingPipeline:
         X_val   = transform_X_with_scaler(X_val,   feature_scaler)
 
         
+
+        # Becasue our target is "Clear Sky Index" which is already scaled.
         target_scaler = None
         if self.config.get("scale_target", False):
             target_scaler = fit_target_scaler(Y_train)
             Y_train = transform_Y_with_scaler(Y_train, target_scaler)
             Y_val   = transform_Y_with_scaler(Y_val,   target_scaler)
+        
+        logger.info(f"X_train scaled range: [{X_train.min():.3f}, {X_train.max():.3f}]")
+        logger.info(f"Y_train scaled range: [{Y_train.min():.3f}, {Y_train.max():.3f}]")
 
         self.scaler_info = {
             "feature_scaler": feature_scaler,
@@ -184,38 +196,32 @@ class SolarForecastingPipeline:
             scaler_info=scaler_info,
         )
 
-        comparison_df = None
-        if labels_index is not None and reference_df is not None:
-            try:
+        for k in ("MAPE", "sMAPE", "sMAPE_%", "per_horizon_MAPE"):
+            val_metrics.pop(k, None)
 
+        comparison_df = None
+        # Optional legacy NAM block (off by default)
+        if self.config.get("enable_legacy_nam_compare", False):
+            try:
                 ref_df = reference_df
                 if isinstance(ref_df.index, pd.DatetimeIndex) and (ref_df.index.name == "target_time"):
-                    tmp = ref_df.reset_index()  # brings 'target_time' as a column
+                    tmp = ref_df.reset_index()
                     tmp["date"] = tmp["target_time"].dt.normalize()
-                    # Create a simple running bin_id per day in the existing order
                     tmp["bin_id"] = tmp.groupby("date").cumcount()
-                    # Ensure columns expected downstream exist
                     if "nam_csi" not in tmp.columns and {"nam_ghi", "clear_sky_ghi"}.issubset(tmp.columns):
                         tmp["nam_csi"] = tmp["nam_ghi"] / tmp["clear_sky_ghi"]
                     ref_df = tmp.set_index(["date", "bin_id"]).sort_index()
 
                 comparison_df = build_comparison_table(
-                    val_pred,
-                    val_true,
-                    val_idx,
-                    labels_index,
-                    ref_df,          # <-- use the shimmed ref_df
-                    fold_id,
+                    val_pred, val_true, val_idx, labels_index, ref_df, fold_id
                 )
                 nam_metrics = compute_nam_comparison_metrics(comparison_df)
                 if nam_metrics:
                     val_metrics.update(nam_metrics)
             except Exception as exc:
-                logger.warning(
-                    "Failed to compute NAM comparison metrics for fold %s: %s",
-                    fold_id,
-                    exc,
-                )
+                logger.warning("Legacy NAM compare failed (disabled by default): %s", exc)
+        
+        
         else:
             if labels_index is None:
                 logger.warning(
@@ -229,27 +235,119 @@ class SolarForecastingPipeline:
                 )
         
         # Save results
+        
+        
+        
+        self.tracker.plot_training_history(history, fold=fold_id)
+        self.tracker.save_predictions_plot(val_true, val_pred, fold=fold_id, split='validation')
+
         self.tracker.save_model(model, fold=fold_id, is_best=True)
         self.tracker.save_training_history(history, fold=fold_id)
         self.tracker.save_metrics(val_metrics, fold=fold_id, split='validation')
-        self.tracker.plot_training_history(history, fold=fold_id)
-        self.tracker.save_predictions_plot(val_true, val_pred, fold=fold_id, split='validation')
-        if comparison_df is not None and not comparison_df.empty:
-            self.tracker.save_comparison_table(
-                comparison_df,
-                fold=fold_id,
-                split='validation',
-            )
-            self.tracker.save_nam_comparison_plot(
-                comparison_df,
-                metrics=val_metrics,
-                fold=fold_id,
-                split='validation',
-            )
-        
-        logger.info(f"Fold {fold_id} - Validation Metrics:")
-        for metric, value in val_metrics.items():
-            logger.info("  %s: %s", metric, _fmt_metric(value))
+
+        # --- Build a benchmark report vs NAM & Naive on CSI and GHI ---
+        try:
+            import os
+
+            if labels_index is None:
+                logger.warning("Labels index missing; skipping benchmark for fold %s.", fold_id)
+            elif self.reference_df is None:
+                logger.warning("reference_df is None; set pipeline.reference_df = fixed_df before run() to enable benchmarks.")
+            else:
+                # 1) Flatten truth/preds from the evaluation you already did
+                #    val_true / val_pred are in CSI space (thanks to scaler_info)
+                y_true_csi = np.asarray(val_true, dtype=float).reshape(-1)
+                y_pred_csi = np.asarray(val_pred, dtype=float).reshape(-1)
+
+                # 2) Steps-per-day: prefer config, else infer from X shape
+                spd = self.config.get("model_config", {}).get("steps_per_day", 11)
+                if spd is None:
+                    spd = int(X.shape[2])  # (N, history_days, steps_per_day, features)
+
+                # 3) Build label_times of length N_val * spd
+                #    Take validation *days* (one per sample) and expand by canonical intraday times
+                val_days = pd.to_datetime(labels_index[val_idx], utc=True).normalize()
+
+                ref_idx = self.reference_df.index
+                if not isinstance(ref_idx, pd.DatetimeIndex):
+                    ref_idx = pd.to_datetime(ref_idx, utc=True, errors="coerce")
+
+                # Make tz-aware UTC
+                if ref_idx.tz is None:
+                    ref_idx = ref_idx.tz_localize("UTC")
+                else:
+                    ref_idx = ref_idx.tz_convert("UTC")
+
+                # Pick the most common times-of-day; sort chronologically
+                tod_counts = pd.Series(ref_idx.time).value_counts()
+                top_times_sorted = sorted(list(tod_counts.index[:spd]))
+
+                label_times_list = []
+                for d in val_days:
+                    d_date = d.date()  # python date
+                    for t in top_times_sorted:
+                        # combine as naive, then localize to UTC (no tz kwarg)
+                        ts_naive = pd.Timestamp.combine(d_date, t)
+                        ts = pd.Timestamp(ts_naive).tz_localize("UTC")
+                        label_times_list.append(ts)
+
+                label_times = pd.DatetimeIndex(label_times_list)
+
+                if len(label_times) != y_true_csi.size:
+                    raise RuntimeError(
+                        f"Label-times length mismatch: got {len(label_times)} vs {y_true_csi.size} "
+                        f"(expected N_val*steps_per_day). Check steps_per_day and reference intraday times."
+                    )
+
+                # 4) Column mapping (ensure clear-sky column is correct!)
+                colmap = {
+                    "truth_csi": self.config.get("truth_csi_col", "actual_csi"),
+                    "truth_ghi": self.config.get("truth_ghi_col", None),
+                    "ghi_cs":    self.config.get("ghi_cs_col",  "clear_sky_ghi"),
+                    "nam_ghi":   self.config.get("nam_ghi_col", "nam_ghi"),
+                    "nam_csi":   self.config.get("nam_csi_col", None),
+                }
+
+                # 5) Output dir and run
+                bench_root = os.path.join(self.tracker.exp_dir, self.benchmark_dirname)
+                fold_dir = os.path.join(bench_root, f"fold_{int(fold_id)}")
+                os.makedirs(fold_dir, exist_ok=True)
+
+                logger.info("Benchmark colmap: %s", colmap)
+                logger.info("ref_df columns (first 10): %s", list(self.reference_df.columns)[:10])
+                logger.info("label_times: %d  | y_true: %d | y_pred: %d", len(label_times), y_true_csi.size, y_pred_csi.size)
+                out = run_benchmark_report(
+                    out_dir=fold_dir,
+                    label_times=label_times,
+                    y_true_csi=y_true_csi,
+                    y_pred_csi=y_pred_csi,
+                    reference_df=self.reference_df,
+                    column_map=colmap,
+                    tag="validation",
+                    make_plots=True,
+                );
+                # Add skill vs NAM / Naive (RMSE & MAE) to metrics so they appear in the summary
+                # svnam = out.get("Skill_vs_NAM", {})
+                # svnv  = out.get("Skill_vs_Naive", {})
+                # Add “forecast skill vs Smart Persistence” for BOTH Ours and NAM
+                svsp_ours = out.get("Skill_vs_SP_Ours", {})
+                svsp_nam  = out.get("Skill_vs_SP_NAM",  {})
+                # Keep names short and clear
+                skill_updates = {
+                    # Ours vs SP
+                    "GHI_RMSE_skill_Ours_vs_SP": svsp_ours.get("GHI_RMSE_Skill_Ours_vs_SP"),
+                    "GHI_MAE_skill_Ours_vs_SP":  svsp_ours.get("GHI_MAE_Skill_Ours_vs_SP"),
+                    "CSI_RMSE_skill_Ours_vs_SP": svsp_ours.get("CSI_RMSE_Skill_Ours_vs_SP"),
+                    "CSI_MAE_skill_Ours_vs_SP":  svsp_ours.get("CSI_MAE_Skill_Ours_vs_SP"),
+                    # NAM vs SP
+                    "GHI_RMSE_skill_NAM_vs_SP":  svsp_nam.get("GHI_RMSE_Skill_NAM_vs_SP"),
+                    "GHI_MAE_skill_NAM_vs_SP":   svsp_nam.get("GHI_MAE_Skill_NAM_vs_SP"),
+                    "CSI_RMSE_skill_NAM_vs_SP":  svsp_nam.get("CSI_RMSE_Skill_NAM_vs_SP"),
+                    "CSI_MAE_skill_NAM_vs_SP":   svsp_nam.get("CSI_MAE_Skill_NAM_vs_SP"),
+                }
+                val_metrics.update({k: float(v) for k, v in skill_updates.items() if v is not None and np.isfinite(v)})
+        except Exception as e:
+            logger.warning("Benchmark report generation failed for fold %s: %s", fold_id, e)
         
         return {
             'history': history,
@@ -298,9 +396,8 @@ class SolarForecastingPipeline:
                 from .evaluation_utils import build_reference_from_existing
                 logger.info("Building simple reference from existing columns (no pvlib, no regridding)...")
                 # Use the SAME merged dataframe you used to build arrays (before windowing)
-                # Suppose it's called `merged_df` or `base_df` in your pipeline
                 self.reference_df = build_reference_from_existing(
-                    base_df,                         # <-- your processed/merged modeling df
+                    base_df,                         # <-- processed/merged modeling df
                     time_col="measurement_time",
                     nam_time_col="nam_target_time",
                     meas_ghi_col="ghi",
@@ -308,6 +405,12 @@ class SolarForecastingPipeline:
                     cs_ghi_col="GHI_cs",
                     actual_csi_col="CSI_ghi",
                 )
+                # enforce the correct default mapping if user didn't override
+                self.config.setdefault("truth_csi_col", "actual_csi")
+                self.config.setdefault("truth_ghi_col", "actual_ghi")      # optional; else reconstruct from CSI*clear_sky_ghi
+                self.config.setdefault("ghi_cs_col",  "clear_sky_ghi")
+                self.config.setdefault("nam_ghi_col", "nam_ghi")
+                self.config.setdefault("nam_csi_col", "nam_csi")           # optional; benchmark will compute if missing
                 logger.info("Reference dataframe prepared (%d rows).", len(self.reference_df))
             except Exception as exc:
                 logger.warning("Failed to construct simple reference: %s", exc)

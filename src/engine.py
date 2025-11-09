@@ -72,6 +72,8 @@ def _extract_xy(batch):
         "{'X'/'features', 'Y'/'target'}."
     )
 
+
+
 # Training Functions
 
 def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader,
@@ -119,16 +121,18 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
             Xb, Yb = _extract_xy(batch)
             Xb, Yb = _move_to_device(Xb, device), _move_to_device(Yb, device)
 
+            # Prevent gradients accumulation
             optimizer.zero_grad()
             outputs = model(Xb)
             loss = criterion(outputs, Yb)
 
             loss.backward()
+            # prevents exploding gradients
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             train_loss += loss.item()
-            # safer & faster than sklearn per-batch
+            
             train_mae  += F.l1_loss(outputs, Yb).item()
             train_batches += 1
 
@@ -201,6 +205,9 @@ import numpy as np
 import torch
 
 def _maybe_inverse_scale(y, scaler):
+    """
+    automatically reverse the data scaling that was applied to the target variable (y) before model training.
+    """
     if scaler is None:
         return y
     y2 = y.reshape(-1, 1)
@@ -208,17 +215,25 @@ def _maybe_inverse_scale(y, scaler):
     return y2
 
 def _compute_metrics(y_true, y_pred, eps=1e-8):
+    """
+    takes the true values (y_true), the predicted values (y_pred), and an eps (epsilon) argument.
+    eps=1e-8 is a very small number used to prevent division-by-zero errors, which is a critical part of the "safe MAPE" calculation.
+    """
     # Works for shapes (N,H,K) or (N,H,K,1); squeeze last dim if singleton
+    # squeezes the array, removing that unnecessary dimension to make it (Samples, Horizon, Features)
     if y_true.ndim == 4 and y_true.shape[-1] == 1:
         y_true = y_true[..., 0]
     if y_pred.ndim == 4 and y_pred.shape[-1] == 1:
         y_pred = y_pred[..., 0]
 
     mae  = np.mean(np.abs(y_pred - y_true))
+    # gives a much higher weight to large errors.
     rmse = np.sqrt(np.mean((y_pred - y_true) ** 2))
     # safe MAPE for irradiance/CSI-like targets
     mape = np.mean(np.abs((y_pred - y_true) / (np.clip(np.abs(y_true), eps, None))))
     # per-horizon (if H>1)
+    # returning an array of MAE values, one for each step in your forecast horizon
+    # see exactly how model's accuracy degrades as it predicts further into the future
     per_h_mae = np.mean(np.abs(y_pred - y_true), axis=(0,2)) if y_true.ndim == 3 else None
     return {"MAE": float(mae), "RMSE": float(rmse), "MAPE": float(mape),
             "per_horizon_MAE": per_h_mae}
@@ -230,8 +245,10 @@ def evaluate(model, loader, scaler_info=None, device="cuda"):
 
     with torch.no_grad():
         for batch in loader:
-            Xb, Yb = _extract_xy(batch)                       # <— use helper
+            # Xb: input features, Yb: true target values
+            Xb, Yb = _extract_xy(batch)                      
             Xb, Yb = _move_to_device(Xb, device), _move_to_device(Yb, device)
+            # Pb: Predicted Batch: model's output
             Pb = model(Xb)
             y_true_all.append(Yb.detach().cpu().numpy())
             y_pred_all.append(Pb.detach().cpu().numpy())
@@ -240,6 +257,7 @@ def evaluate(model, loader, scaler_info=None, device="cuda"):
     y_pred = np.concatenate(y_pred_all, axis=0)
 
     ts = (scaler_info or {}).get("target_scaler", None)
+    # ts = scaler_info
     y_true = _maybe_inverse_scale(y_true, ts)
     y_pred = _maybe_inverse_scale(y_pred, ts)
 
