@@ -16,8 +16,6 @@ logger = logging.getLogger(__name__)
 
 # Model Definitions
 
-import torch
-import torch.nn as nn
 
 class ImprovedLSTM(nn.Module):
     """
@@ -122,7 +120,16 @@ class ImprovedLSTM(nn.Module):
         y = self.output_projection(self.dropout(last_hidden))  # (B, H*S)
         y = y.view(B, self.horizon_days, self.steps_per_day)   # (B, H, S)
         return y
+
+
+class RNNModel(nn.Module):
+    def __init__(self, nlayers:int, seq_len:int):
+        super().__init__()
+        pass
     
+
+class VanilaMamba(nn.Module):
+    pass
 
 class MATNet(nn.Module):
     """Multi-Attention Transformer Network for solar forecasting"""

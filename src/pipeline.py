@@ -254,15 +254,24 @@ class SolarForecastingPipeline:
             elif self.reference_df is None:
                 logger.warning("reference_df is None; set pipeline.reference_df = fixed_df before run() to enable benchmarks.")
             else:
-                # 1) Flatten truth/preds from the evaluation you already did
+                # 1) Flatten truth/preds from the evaluation  already did
                 #    val_true / val_pred are in CSI space (thanks to scaler_info)
                 y_true_csi = np.asarray(val_true, dtype=float).reshape(-1)
                 y_pred_csi = np.asarray(val_pred, dtype=float).reshape(-1)
 
                 # 2) Steps-per-day: prefer config, else infer from X shape
-                spd = self.config.get("model_config", {}).get("steps_per_day", 11)
-                if spd is None:
-                    spd = int(X.shape[2])  # (N, history_days, steps_per_day, features)
+                # spd = self.config.get("model_config", {}).get("steps_per_day", 11)
+                # if spd is None:
+                #     spd = int(X.shape[2])  # (N, history_days, steps_per_day, features)
+                # 2) Steps-per-day: derive from model output grid to avoid config drift
+                try:
+                    spd = int(np.asarray(val_pred).shape[-1])  # (N_val, horizon_days, steps_per_day)
+                except Exception:
+                    # Fallbacks if evaluate_model returns different shapes
+                    if isinstance(Y, np.ndarray) and Y.ndim >= 3:
+                        spd = int(Y.shape[2])
+                    else:
+                        spd = int(X.shape[2])
 
                 # 3) Build label_times of length N_val * spd
                 #    Take validation *days* (one per sample) and expand by canonical intraday times

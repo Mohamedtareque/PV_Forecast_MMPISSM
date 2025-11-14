@@ -26,11 +26,40 @@ import matplotlib.pyplot as plt
 # Metrics & skill helpers
 # ========================
 
+
+def daily_persistence(series: pd.Series, timestamps: pd.DatetimeIndex, days_back: int = 1) -> np.ndarray:
+    """
+    Naive day-ahead baseline:
+        value(t) = series(t - days_back * 1 day)
+    This works with any regular/irregular sampling since we directly reindex
+    at (timestamps - days_back days).
+    """
+    series = _ensure_datetime_index(series.copy())
+    ts = pd.DatetimeIndex(timestamps) - pd.Timedelta(days=days_back)
+    vals = series.reindex(ts).values.astype(float)
+    return vals
+
+def standard_naive_persistence(series: pd.Series,
+                               timestamps: pd.DatetimeIndex,
+                               steps_back: int = 1) -> np.ndarray:
+    """
+    One-step (or multi-step) naive persistence on the evaluation grid.
+    Forecast(t_k) = Value at t_{k-steps_back} on the SAME timestamp grid.
+
+    Returns an array aligned to `timestamps`.
+    """
+    s = _ensure_datetime_index(series.copy())
+    ts = pd.DatetimeIndex(timestamps)
+    aligned = s.reindex(ts)              # align to evaluation grid
+    persisted = aligned.shift(steps_back)  # previous sample(s) on that grid
+    return persisted.values.astype(float)
+
 def smart_persistence_csi(csi_series: pd.Series,
                           timestamps: pd.DatetimeIndex,
                           days_back: int = 1) -> np.ndarray:
     # persist yesterday’s CSI at the same intraday time
-    return daily_persistence(csi_series, timestamps, days_back=days_back)
+    # return daily_persistence(csi_series, timestamps, days_back=days_back)
+    return standard_naive_persistence(csi_series, timestamps)
 
 def smart_persistence_ghi(csi_series: pd.Series,
                           ghi_cs_series: pd.Series,
@@ -161,18 +190,6 @@ def align_series_to_timestamps(series: pd.Series, timestamps: pd.DatetimeIndex) 
     aligned = series.reindex(ts)
     return aligned.values.astype(float)
 
-
-def daily_persistence(series: pd.Series, timestamps: pd.DatetimeIndex, days_back: int = 1) -> np.ndarray:
-    """
-    Naive day-ahead baseline:
-        value(t) = series(t - days_back * 1 day)
-    This works with any regular/irregular sampling since we directly reindex
-    at (timestamps - days_back days).
-    """
-    series = _ensure_datetime_index(series.copy())
-    ts = pd.DatetimeIndex(timestamps) - pd.Timedelta(days=days_back)
-    vals = series.reindex(ts).values.astype(float)
-    return vals
 
 
 # ==========================
