@@ -9,10 +9,21 @@ import torch.nn as nn
 import logging
 import torch
 
+import base
+from typing import List,Union
+
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# Batch Normalization
+class MyBN(nn.Module):
+    def __init__(self,channels):
+        super(MyBN, self).__init__()
+        self.BN = nn.BatchNorm1d(channels)
+    def forward(self,x):
+        return self.BN(x.permute(0,2,1)).permute(0,2,1)
 
 # Model Definitions
 
@@ -122,11 +133,15 @@ class ImprovedLSTM(nn.Module):
         return y
 
 
-class RNNModel(nn.Module):
-    def __init__(self, nlayers:int, seq_len:int):
+class SimpleRNNModel(nn.Module):
+    def __init__(self, input_size:int, hidden_size: int, num_layers: int, output_size: int):
         super().__init__()
         pass
+
     
+
+        
+
 
 class VanilaMamba(nn.Module):
     pass
