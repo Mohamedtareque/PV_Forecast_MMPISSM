@@ -1,0 +1,20 @@
+{
+  "target_station": 7,
+  "data_dir": "/home/muhammadhassan/App_v02/physics_informed_inves/PVODdatasets_v1",
+  "metadata_file": "metadata.csv",
+  "n_splits": 4,
+  "seq_len": 672,
+  "pred_len": 96,
+  "batch_size": 64,
+  "epochs": 30,
+  "learning_rate": 0.0005,
+  "warmup_epochs": 5,
+  "lambda_data": 1.0,
+  "lambda_night": 0.2,
+  "lambda_mono": 0.1,
+  "T_ref": 25.0,
+  "G_night_thr": 10.0,
+  "output_dir": "./benchmark_results",
+  "save_predictions": true,
+  "save_models": false
+}
