@@ -1,0 +1,122 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+
+\title{Methodology: Physics V04 (Robust) and V05 (Hyper‑Robust) Models}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Overview}
+This document provides a concise, mathematically‑rigorous description of the two physics‑informed Mamba variants used in the photovoltaic (PV) power forecasting pipeline: \textbf{Physics V04 (Robust)} and \textbf{Physics V05 (Hyper‑Robust)}. Both models share a common data‑driven backbone (Mamba) but differ in the way physical knowledge is incorporated and how spatial information from a neighboring station (S8) is used.
+
+\section{Physics V04 (Robust)}
+
+\subsection{Physical Layer}
+The V04 model embeds three deterministic components:
+\begin{enumerate}
+  \item \textit{Incidence Angle Modifier (IAM)} to account for panel tilt and solar geometry.
+  \item \textit{Faiman temperature model} for cell temperature $T_{\text{cell}}$:
+  \begin{equation}
+    T_{\text{cell}} = T_{\text{amb}} + \frac{G}{U_{0} + U_{1}\,W + \epsilon},
+    \label{eq:faiman}
+  \end{equation}
+  where $T_{\text{amb}}$ is ambient temperature, $G$ global irradiance, $W$ wind speed, $U_{0},U_{1}>0$ are learnable heat‑loss coefficients, and $\epsilon$ ensures numerical stability.
+  \item \textit{Inverter efficiency curve} modelled with a sigmoid:
+  \begin{equation}
+    \eta_{\text{inv}} = \sigma\big(k_{\text{inv}}\,(P_{\text{dc}} - \tau_{\text{inv}})\big),
+    \label{eq:inv}
+  \end{equation}
+  where $P_{\text{dc}}$ is the DC power (see below), $k_{\text{inv}}$ controls the steepness and $\tau_{\text{inv}}$ is the turn‑on threshold.
+\end{enumerate}
+
+The DC power estimate follows a standard PV equation with a learnable efficiency $\eta$ and temperature coefficient $\gamma$:
+\begin{equation}
+  P_{\text{dc}} = \eta\,P_{\text{stc}}\,\frac{G}{G_{\text{stc}}}\bigl(1 + \gamma\,(T_{\text{cell}} - T_{\text{ref}})\bigr),
+  \label{eq:dc_power}
+\end{equation}
+with $P_{\text{stc}}$ the rated power at standard test conditions and $T_{\text{ref}}=\SI{25}{\celsius}$.
+
+The final physics‑based power is obtained by applying the inverter and a soft capacity constraint:
+\begin{equation}
+  P_{\text{phys}} = \operatorname{ReLU}\bigl(P_{\text{dc}}\bigr)\,\eta_{\text{inv}},
+\end{equation}
+\begin{equation}
+  P_{\text{final}} = P_{\text{cap}}\,\tanh\bigl(\frac{P_{\text{phys}}\,s}{P_{\text{cap}}}\bigr),
+\end{equation}
+where $P_{\text{cap}}$ and $s$ are learnable positive parameters.
+
+\subsection{Spatial Interaction and Smoothness}
+A static spatial term leverages the neighboring station (S8) through a wind‑alignment factor:
+\begin{equation}
+  \text{WindAlign}=\max\bigl(0,\cos(\theta_{\text{wind}}-\phi_{\text{bearing}})\bigr),
+\end{equation}
+and an interaction feature $\Delta E_{\text{S8}}$ (difference between measured and NWP clear‑sky index). The residual Mamba learner receives the concatenated vector $[X_{\text{S7}},\,\text{WindAlign}\,\Delta E_{\text{S8}}]$.
+
+A smoothness loss penalises high‑frequency changes in the predicted power:
+\begin{equation}
+  \mathcal{L}_{\text{smooth}} = \lambda_{\text{smooth}}\frac{1}{H-1}\sum_{t=1}^{H-1}\bigl|P_{t+1}-P_{t}\bigr|.
+\end{equation}
+
+\section{Physics V05 (Hyper‑Robust)}
+
+V05 builds on V04 but replaces the static spatial term with a dynamic advection‑lag model and a differentiable soft‑attention gate.
+
+\subsection{Advection Lag Computation}
+Given the inter‑station distance $D=\SI{1200}{\meter}$ and the wind component aligned with the bearing $v_{\parallel}=v\,\cos(\theta_{\text{wind}}-\phi_{\text{bearing}})$, the physical advection time is $t_{\text{adv}}=D/v_{\parallel}$. The lag in discrete steps (15‑min resolution) is
+\begin{equation}
+  L = \operatorname{clip}\bigl(\frac{t_{\text{adv}}}{\Delta t},\;L_{\min},\;L_{\max}\bigr),
+\end{equation}
+with $\Delta t=\SI{900}{\second}$, $L_{\min}=1$, $L_{\max}=8$.
+The neighbor feature series $X_{\text{S8}}$ is shifted by $L$ steps:
+\begin{equation}
+  X_{\text{S8,shifted}}[t] = X_{\text{S8}}[t-L],
+\end{equation}
+using a boundary condition that repeats the earliest available value.
+
+\subsection{Soft Attention Gate}
+A small MLP produces a continuous gating coefficient $\beta\in[0,1]$:
+\begin{equation}
+  \beta = \sigma\bigl(\mathbf{w}^{\top}\,\operatorname{ReLU}(\mathbf{W}\,[v,\cos(\theta_{\text{wind}}-\phi_{\text{bearing}}]) + b\bigr),
+\end{equation}
+ensuring differentiability. The final gated neighbor feature is $\beta\,X_{\text{S8,shifted}}$.
+
+\subsection{High‑Capacity Mamba Backbone}
+V05 employs a larger state dimension ($d_{\text{state}}=128$) and convolution width ($d_{\text{conv}}=4$) to capture the richer temporal dynamics introduced by the lagged spatial information.
+
+\section{Comparison of V04 and V05}
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|l|l|}
+\hline
+Component & V04 (Robust) & V05 (Hyper‑Robust) \\
+\hline
+Spatial handling & Static wind‑aligned interaction & Dynamic advection lag + soft attention \\
+\hline
+Mamba capacity & $d_{\text{state}}=16$ & $d_{\text{state}}=128$ \\
+\hline
+Physics layer & IAM, Faiman, inverter, capacity & Same + lag computation \\
+\hline
+Losses & Data + night + smooth & Data + night + smooth \\
+\hline
+\end{tabular}
+\caption{Key architectural differences.}
+\end{table}
+
+\section{Relation to \texttt{v05_experiment_runner.py}}
+The tutorial does not modify the runner script; it merely documents how the configurations defined in that script instantiate the V04 and V05 models. The runner supplies past observations, future NWP forecasts, and the spatial deltas required by the physics layers described above.
+
+\section{References}
+\begin{thebibliography}{9}
+\bibitem{faiman} Faiman, D. (2008). \textit{PV module temperature model for photovoltaic performance assessment}. Applied Energy.
+\bibitem{mamba} Gu, S. et al. (2022). \textit{Mamba: Linear-time sequence modeling with selective state spaces}. arXiv.
+\bibitem{pvlib} Sandia National Laboratories. (2020). \textit{PVLIB Python: A python library for modeling photovoltaic systems}.
+\end{thebibliography}
+
+\end{document}
