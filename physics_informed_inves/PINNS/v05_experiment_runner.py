@@ -69,33 +69,21 @@ def get_station_metadata(station_num: int, df: pd.DataFrame) -> Dict[str, any]:
     }
 
 
-
-def calculate_clearsky_indices(metadata: Dict, df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calculates both Irradiance (K_CS) and Power (K_PV) Clear Sky Indices.
-    Uses McClear (satellite-based) with Ineichen fallback.
-    """
-    print(f"--- Processing {metadata.get('Station_ID', 'Unknown')} ---")
-    
-    lat = metadata['Latitude']
-    lon = metadata['Longitude']
-    site = location.Location(lat, lon, tz='UTC')
-    
+# calculate clearsky indices based on site 
+def calculate_clearsky_indices(latitude:float, longitude:float, email:str, df: pd.DataFrame) -> pd.DataFrame:
+    site = location.Location(latitude, longitude, tz='UTC')
     if not isinstance(df.index, pd.DatetimeIndex):
         if 'date_time' in df.columns:
-            df['date_time'] = pd.to_datetime(df['date_time']) 
+            df['date_time'] = pd.to_datetime(df['date_time'],  utc=True) 
             df.set_index('date_time', inplace=True)
-        
-    print("Calculating Clear Sky Irradiance...")
+            df = df.sort_index()
     
-    # Try McClear first (more accurate satellite-based model)
+        # Try McClear first (more accurate satellite-based model)
     try:
         from pvlib.iotools import get_cams
-        email = 'mohamedtareck95@gmail.com'
-        
         cams_data, cams_meta = get_cams(
-            latitude=metadata['Latitude'],
-            longitude=metadata['Longitude'],
+            latitude=latitude,
+            longitude=longitude,
             start=df.index.min(),
             end=df.index.max(),
             email=email,
@@ -119,81 +107,141 @@ def calculate_clearsky_indices(metadata: Dict, df: pd.DataFrame) -> pd.DataFrame
         print(f"⚠ McClear failed ({e}), falling back to Ineichen")
         cs = site.get_clearsky(df.index, model='ineichen')
 
+    cs = cs.reindex(df.index, method='nearest')
     df['GHI_clr'] = cs['ghi'].values  # Use .values to avoid index issues
-
-    if 'lmd_totalirrad' in df.columns:
-        meas_ghi = df['lmd_totalirrad']
-        df['K_CS_day'] = np.where(df['GHI_clr'] > 10, meas_ghi / df['GHI_clr'], 0.0)
-        df['K_CS_dayNight'] = meas_ghi / df['GHI_clr']
-        df['K_CS'] = df['K_CS_day']
-        df['K_CS'] = df['K_CS'].clip(lower=0.0, upper=1.25)
-    else:
-        print("Warning: 'lmd_totalirrad' column missing. K_CS not calculated.")
-
-    # PV System Model
-    try:
-        tilt_str = str(metadata.get('Array_Tilt'))
-        tilt_match = re.search(r"[\d.]+", tilt_str)
-        tilt = float(tilt_match.group()) if tilt_match else 31.0
-    except:
-        tilt = 31.0
-    
-    module_params = pvsystem.retrieve_sam('CECMod')['Yingli_Energy__China__YL250P_29b']
-    block_dc_watts = (metadata['Modules_per_String'] * metadata['Strings_per_Inverter'] * metadata['Module_Pmax'])
-    
-    # BYD 500kW Inverter Parameters
-    inverter_parameters = {
-        'Vac': 480,
-        'Pso': 4549.66,
-        'Paco': 501756,
-        'Pdco': 521992,
-        'Vdco': 890,
-        'C0': -3.45645e-08,
-        'C1': 2.12268e-05,
-        'C2': 0.000603471,
-        'C3': 0.000463011,
-        'Pnt': 2.0,
-        'Vdcmax': 1000,
-        'Idcmax': 586.508,
-        'Mppt_low': 780,
-        'Mppt_high': 1000
-    }
-    
-    temp_model = TEMPERATURE_MODEL_PARAMETERS['sapm']['open_rack_glass_glass']
-    
-    system = pvsystem.PVSystem(
-        surface_tilt=tilt,
-        surface_azimuth=180,
-        module_parameters=module_params,
-        inverter_parameters=inverter_parameters,
-        temperature_model_parameters=temp_model,
-        modules_per_string=metadata['Modules_per_String'],
-        strings_per_inverter=metadata['Strings_per_Inverter']
-    )
-
-    print("Running PV Power Simulation...")
-    mc = modelchain.ModelChain(system, site, transposition_model='perez',
-                               solar_position_method='nrel_numpy',
-                               aoi_model='physical', spectral_model='no_loss')
-    mc.run_model(cs)
-
-    station_total_capacity_watts = metadata['Capacity'] * 1000
-    scaling_factor = station_total_capacity_watts / block_dc_watts
-    
-    p_clr_watts = mc.results.ac.fillna(0) * scaling_factor
-    df['P_CLR'] = p_clr_watts / 1_000_000 
-
-    if 'power' in df.columns:
-        meas_power = df['power']
-        if meas_power.max() > 500:
-            meas_power = meas_power / 1000.0
-            
-        df['K_PV'] = np.where(df['P_CLR'] > 1.0, meas_power / df['P_CLR'], 0.0)
-        df['K_PV'] = df['K_PV'].clip(lower=0.0, upper=1.25)
-    else:
-        print("Warning: 'power' column missing. K_PV not calculated.")
+    df['dni_clr'] = cs['dni'].values  # Use .values to avoid index issues
+    df['dhi_clr'] = cs['dhi'].values  # Use .values to avoid index issues
 
     return df
+
+
+    
+    
+
+# def calculate_clearsky_indices(metadata: Dict, df: pd.DataFrame) -> pd.DataFrame:
+#     """
+#     Calculates both Irradiance (K_CS) and Power (K_PV) Clear Sky Indices.
+#     Uses McClear (satellite-based) with Ineichen fallback.
+#     """
+#     print(f"--- Processing {metadata.get('Station_ID', 'Unknown')} ---")
+    
+#     lat = metadata['Latitude']
+#     lon = metadata['Longitude']
+#     site = location.Location(lat, lon, tz='UTC')
+    
+#     if not isinstance(df.index, pd.DatetimeIndex):
+#         if 'date_time' in df.columns:
+#             df['date_time'] = pd.to_datetime(df['date_time']) 
+#             df.set_index('date_time', inplace=True)
+        
+#     print("Calculating Clear Sky Irradiance...")
+    
+#     # Try McClear first (more accurate satellite-based model)
+#     try:
+#         from pvlib.iotools import get_cams
+#         email = 'mohamedtareck95@gmail.com'
+        
+#         cams_data, cams_meta = get_cams(
+#             latitude=metadata['Latitude'],
+#             longitude=metadata['Longitude'],
+#             start=df.index.min(),
+#             end=df.index.max(),
+#             email=email,
+#             identifier='mcclear',
+#             time_step='15min',
+#             time_ref='UT',
+#             integrated=False,
+#             map_variables=True
+#         )
+        
+#         cs = cams_data.rename(columns={
+#             'ghi_clear': 'ghi',
+#             'dni_clear': 'dni',
+#             'dhi_clear': 'dhi',
+#         })
+#         # CRITICAL: Reindex CAMS data to match original df index
+#         cs = cs.reindex(df.index, method='nearest')
+#         print("✓ Using McClear (satellite-based, more accurate)")
+        
+#     except Exception as e:
+#         print(f"⚠ McClear failed ({e}), falling back to Ineichen")
+#         cs = site.get_clearsky(df.index, model='ineichen')
+
+#     df['GHI_clr'] = cs['ghi'].values  # Use .values to avoid index issues
+
+#     if 'lmd_totalirrad' in df.columns:
+#         meas_ghi = df['lmd_totalirrad']
+#         df['K_CS_day'] = np.where(df['GHI_clr'] > 10, meas_ghi / df['GHI_clr'], 0.0)
+#         df['K_CS_dayNight'] = meas_ghi / df['GHI_clr']
+#         df['K_CS'] = df['K_CS_day']
+#         df['K_CS'] = df['K_CS'].clip(lower=0.0, upper=1.25)
+#     else:
+#         print("Warning: 'lmd_totalirrad' column missing. K_CS not calculated.")
+
+#     # PV System Model
+#     try:
+#         tilt_str = str(metadata.get('Array_Tilt'))
+#         tilt_match = re.search(r"[\d.]+", tilt_str)
+#         tilt = float(tilt_match.group()) if tilt_match else 31.0
+#     except:
+#         tilt = 31.0
+    
+#     module_params = pvsystem.retrieve_sam('CECMod')['Yingli_Energy__China__YL250P_29b']
+#     block_dc_watts = (metadata['Modules_per_String'] * metadata['Strings_per_Inverter'] * metadata['Module_Pmax'])
+    
+#     # BYD 500kW Inverter Parameters
+#     inverter_parameters = {
+#         'Vac': 480,
+#         'Pso': 4549.66,
+#         'Paco': 501756,
+#         'Pdco': 521992,
+#         'Vdco': 890,
+#         'C0': -3.45645e-08,
+#         'C1': 2.12268e-05,
+#         'C2': 0.000603471,
+#         'C3': 0.000463011,
+#         'Pnt': 2.0,
+#         'Vdcmax': 1000,
+#         'Idcmax': 586.508,
+#         'Mppt_low': 780,
+#         'Mppt_high': 1000
+#     }
+    
+#     temp_model = TEMPERATURE_MODEL_PARAMETERS['sapm']['open_rack_glass_glass']
+    
+#     system = pvsystem.PVSystem(
+#         surface_tilt=tilt,
+#         surface_azimuth=180,
+#         module_parameters=module_params,
+#         inverter_parameters=inverter_parameters,
+#         temperature_model_parameters=temp_model,
+#         modules_per_string=metadata['Modules_per_String'],
+#         strings_per_inverter=metadata['Strings_per_Inverter']
+#     )
+
+#     print("Running PV Power Simulation...")
+#     mc = modelchain.ModelChain(system, site, transposition_model='perez',
+#                                solar_position_method='nrel_numpy',
+#                                aoi_model='physical', spectral_model='no_loss')
+#     mc.run_model(cs)
+
+#     station_total_capacity_watts = metadata['Capacity'] * 1000
+#     scaling_factor = station_total_capacity_watts / block_dc_watts
+    
+#     p_clr_watts = mc.results.ac.fillna(0) * scaling_factor
+#     df['P_CLR'] = p_clr_watts / 1_000_000 
+
+#     if 'power' in df.columns:
+#         meas_power = df['power']
+#         if meas_power.max() > 500:
+#             meas_power = meas_power / 1000.0
+            
+#         df['K_PV'] = np.where(df['P_CLR'] > 1.0, meas_power / df['P_CLR'], 0.0)
+#         df['K_PV'] = df['K_PV'].clip(lower=0.0, upper=1.25)
+#     else:
+#         print("Warning: 'power' column missing. K_PV not calculated.")
+
+#     return df
 
 
 def calculate_nwp_power(metadata: Dict, df: pd.DataFrame) -> pd.DataFrame:
@@ -305,10 +353,6 @@ def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     # For Feature Prep, we just create the cyclics.
     return data
 
-
-# =============================================================================
-# USER CONFIGURATION
-# =============================================================================
 
 # =============================================================================
 # USER CONFIGURATION

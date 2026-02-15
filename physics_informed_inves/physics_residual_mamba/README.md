@@ -196,15 +196,8 @@ If you use this code in your research, please cite:
 
 ## License
 
-This code is provided for research purposes. Please ensure you have appropriate licenses for any dependencies (mamba-ssm, pvlib, etc.).
+This code is provided for research purposes.
 
-## Contributing
-
-Contributions are welcome! Please ensure:
-- All functions have comprehensive docstrings
-- Type hints are used for function signatures
-- Code follows PEP 8 style guidelines
-- New features include appropriate tests
 
 ## References
 
@@ -213,6 +206,3 @@ Contributions are welcome! Please ensure:
 3. Mamba: Linear-Time Sequence Modeling with Selective State Spaces
 4. pvlib: Python library for photovoltaic system modeling
 
-## Contact
-
-For questions or issues, please contact: contact@example.com
